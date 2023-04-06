@@ -7,6 +7,6 @@ Accept URLs on stdin, output the ones that look 'interesting'
 With Go:
 
 ```
-▶ go get -u github.com/garmir/script-dump/urinteresting
+▶ go get -u github.com/garmir/urinteresting
 ```
 
