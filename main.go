@@ -2,175 +2,323 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"net/url"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 )
 
-// Ideas:
-//   More than, say, 3 query string parameteres (exluding utm_*?)
-//   Popular app names (phpmyadmin etc) in path
-//	 Filenames from configfiles list / seclist
-//   dev/stage/test in path or hostname
-//   jenkins, graphite etc in hostname or path
+type Config struct {
+	verbose       bool
+	showScore     bool
+	minScore      int
+	excludeStatic bool
+	includeJS     bool
+	dedupe        bool
+}
 
-type urlCheck func(*url.URL) bool
+var config Config
+
+type urlCheck struct {
+	name   string
+	weight int
+	check  func(*url.URL) bool
+}
+
+func init() {
+	flag.BoolVar(&config.verbose, "v", false, "Verbose output (show why URLs are interesting)")
+	flag.BoolVar(&config.showScore, "score", false, "Show interestingness score")
+	flag.IntVar(&config.minScore, "min", 1, "Minimum interestingness score")
+	flag.BoolVar(&config.excludeStatic, "no-static", true, "Exclude boring static files")
+	flag.BoolVar(&config.includeJS, "js", false, "Include JavaScript files")
+	flag.BoolVar(&config.dedupe, "dedupe", true, "Deduplicate by host+path+params")
+}
 
 func main() {
+	flag.Parse()
 
 	checks := []urlCheck{
-		// query string stuff
-		func(u *url.URL) bool {
-
-			interesting := 0
-			for k, vv := range u.Query() {
-				for _, v := range vv {
-					if qsCheck(k, v) {
-						interesting++
+		// Critical query string patterns (high weight)
+		{
+			name:   "sql-injection",
+			weight: 3,
+			check: func(u *url.URL) bool {
+				for k, vv := range u.Query() {
+					for _, v := range vv {
+						kl := strings.ToLower(k)
+						vl := strings.ToLower(v)
+						if strings.Contains(vl, "select") || strings.Contains(vl, "union") ||
+							strings.Contains(vl, "insert") || strings.Contains(vl, "update") ||
+							strings.Contains(vl, "delete") || strings.Contains(vl, "drop") ||
+							strings.Contains(kl, "id") || strings.Contains(kl, "user") {
+							return true
+						}
 					}
 				}
-			}
-			return interesting > 0
+				return false
+			},
 		},
 
-		// extensions
-		func(u *url.URL) bool {
-			exts := []string{
-				".php",
-				".phtml",
-				".asp",
-				".aspx",
-				".asmx",
-				".ashx",
-				".cgi",
-				".pl",
-				".json",
-				".xml",
-				".rb",
-				".py",
-				".sh",
-				".yaml",
-				".yml",
-				".toml",
-				".ini",
-				".md",
-				".mkd",
-				".do",
-				".jsp",
-				".jspa",
-			}
-
-			p := strings.ToLower(u.EscapedPath())
-			for _, e := range exts {
-				if strings.HasSuffix(p, e) {
-					return true
+		// Interesting query string parameters
+		{
+			name:   "query-params",
+			weight: 2,
+			check: func(u *url.URL) bool {
+				interesting := 0
+				for k, vv := range u.Query() {
+					for _, v := range vv {
+						if isInterestingParam(k, v) {
+							interesting++
+						}
+					}
 				}
-			}
-
-			return false
+				return interesting > 0
+			},
 		},
 
-		// path bits
-		func(u *url.URL) bool {
-			p := strings.ToLower(u.EscapedPath())
-			return strings.Contains(p, "ajax") ||
-				strings.Contains(p, "jsonp") ||
-				strings.Contains(p, "admin") ||
-				strings.Contains(p, "include") ||
-				strings.Contains(p, "src") ||
-				strings.Contains(p, "redirect") ||
-				strings.Contains(p, "proxy") ||
-				strings.Contains(p, "test") ||
-				strings.Contains(p, "tmp") ||
-				strings.Contains(p, "temp")
+		// Interesting extensions
+		{
+			name:   "extensions",
+			weight: 2,
+			check: func(u *url.URL) bool {
+				interestingExts := []string{
+					".php", ".phtml", ".asp", ".aspx", ".asmx", ".ashx",
+					".cgi", ".pl", ".jsp", ".jspa", ".do", ".action",
+					".json", ".xml", ".api", ".wadl", ".wsdl",
+					".rb", ".py", ".sh", ".bat", ".ps1",
+					".yaml", ".yml", ".toml", ".ini", ".conf", ".config",
+					".bak", ".backup", ".old", ".save", ".swp", ".tmp",
+					".git", ".svn", ".env", ".properties",
+					".sql", ".db", ".sqlite",
+				}
+
+				p := strings.ToLower(u.EscapedPath())
+				for _, ext := range interestingExts {
+					if strings.HasSuffix(p, ext) {
+						return true
+					}
+				}
+				return false
+			},
 		},
 
-		// non-standard port
-		func(u *url.URL) bool {
-			return (u.Port() != "80" && u.Port() != "443" && u.Port() != "")
+		// Sensitive paths
+		{
+			name:   "sensitive-paths",
+			weight: 3,
+			check: func(u *url.URL) bool {
+				p := strings.ToLower(u.EscapedPath())
+				sensitivePaths := []string{
+					"admin", "login", "auth", "api", "v1", "v2", "graphql",
+					"swagger", "docs", "console", "phpmyadmin", "wp-admin",
+					"jmx-console", "manager", "jenkins", "kibana", "grafana",
+					".git", ".svn", ".env", "config", "backup", "dump",
+					"temp", "tmp", "test", "dev", "stage", "debug",
+					"private", "secret", "internal", "upload", "download",
+					"include", "require", "proxy", "redirect", "forward",
+					"exec", "execute", "eval", "system", "shell",
+				}
+
+				for _, sensitive := range sensitivePaths {
+					if strings.Contains(p, sensitive) {
+						return true
+					}
+				}
+				return false
+			},
+		},
+
+		// File operations
+		{
+			name:   "file-operations",
+			weight: 3,
+			check: func(u *url.URL) bool {
+				for k, vv := range u.Query() {
+					kl := strings.ToLower(k)
+					if strings.Contains(kl, "file") || strings.Contains(kl, "path") ||
+						strings.Contains(kl, "dir") || strings.Contains(kl, "folder") ||
+						strings.Contains(kl, "read") || strings.Contains(kl, "write") ||
+						strings.Contains(kl, "upload") || strings.Contains(kl, "download") {
+						return true
+					}
+					for _, v := range vv {
+						if strings.Contains(v, "../") || strings.Contains(v, "..\\") ||
+							strings.Contains(v, "/etc/") || strings.Contains(v, "c:\\") {
+							return true
+						}
+					}
+				}
+				return false
+			},
+		},
+
+		// Non-standard ports
+		{
+			name:   "non-standard-port",
+			weight: 1,
+			check: func(u *url.URL) bool {
+				port := u.Port()
+				return port != "" && port != "80" && port != "443" && port != "8080" && port != "8443"
+			},
+		},
+
+		// SSRF patterns
+		{
+			name:   "ssrf-patterns",
+			weight: 3,
+			check: func(u *url.URL) bool {
+				for k, vv := range u.Query() {
+					kl := strings.ToLower(k)
+					if strings.Contains(kl, "url") || strings.Contains(kl, "uri") ||
+						strings.Contains(kl, "redirect") || strings.Contains(kl, "return") ||
+						strings.Contains(kl, "next") || strings.Contains(kl, "callback") ||
+						strings.Contains(kl, "dest") || strings.Contains(kl, "target") {
+						for _, v := range vv {
+							if strings.HasPrefix(v, "http") || strings.HasPrefix(v, "//") ||
+								strings.Contains(v, "localhost") || strings.Contains(v, "127.0.0.1") ||
+								strings.Contains(v, "169.254") || strings.Contains(v, "0.0.0.0") {
+								return true
+							}
+						}
+					}
+				}
+				return false
+			},
+		},
+
+		// Command injection patterns
+		{
+			name:   "command-injection",
+			weight: 3,
+			check: func(u *url.URL) bool {
+				for _, vv := range u.Query() {
+					for _, v := range vv {
+						if strings.Contains(v, ";") || strings.Contains(v, "|") ||
+							strings.Contains(v, "`") || strings.Contains(v, "$()") ||
+							strings.Contains(v, "&&") || strings.Contains(v, "||") {
+							return true
+						}
+					}
+				}
+				return false
+			},
+		},
+
+		// Authentication/Session
+		{
+			name:   "auth-session",
+			weight: 2,
+			check: func(u *url.URL) bool {
+				for k := range u.Query() {
+					kl := strings.ToLower(k)
+					if strings.Contains(kl, "token") || strings.Contains(kl, "session") ||
+						strings.Contains(kl, "auth") || strings.Contains(kl, "key") ||
+						strings.Contains(kl, "apikey") || strings.Contains(kl, "api_key") ||
+						strings.Contains(kl, "password") || strings.Contains(kl, "passwd") ||
+						strings.Contains(kl, "secret") || strings.Contains(kl, "jwt") {
+						return true
+					}
+				}
+				return false
+			},
 		},
 	}
 
 	seen := make(map[string]bool)
+	var mu sync.Mutex
 
-	sc := bufio.NewScanner(os.Stdin)
-	for sc.Scan() {
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
 
-		u, err := url.Parse(sc.Text())
+		u, err := url.Parse(line)
 		if err != nil {
-			//fmt.Fprintf(os.Stderr, "failed to parse url %s [%s]\n", sc.Text(), err)
+			if config.verbose {
+				fmt.Fprintf(os.Stderr, "Failed to parse URL %s: %v\n", line, err)
+			}
 			continue
 		}
 
-		if isBoringStaticFile(u) {
+		// Skip boring static files unless explicitly included
+		if config.excludeStatic && isBoringStaticFile(u) && !config.includeJS {
 			continue
 		}
 
-		// Go's maps aren't ordered, but we want to use all the param names
-		// as part of the key to output only unique requests. To do that, put
-		// them into a slice and then sort it.
-		pp := make([]string, 0)
-		for p, _ := range u.Query() {
-			pp = append(pp, p)
+		// Deduplication
+		if config.dedupe {
+			key := buildDedupeKey(u)
+			mu.Lock()
+			if seen[key] {
+				mu.Unlock()
+				continue
+			}
+			seen[key] = true
+			mu.Unlock()
 		}
-		sort.Strings(pp)
 
-		key := fmt.Sprintf("%s%s?%s", u.Hostname(), u.EscapedPath(), strings.Join(pp, "&"))
-
-		// Only output each host + path + params combination once
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = true
-
-		interesting := 0
+		// Run checks and calculate score
+		score := 0
+		reasons := []string{}
 
 		for _, check := range checks {
-			if check(u) {
-				interesting++
+			if check.check(u) {
+				score += check.weight
+				reasons = append(reasons, check.name)
 			}
 		}
 
-		if interesting > 0 {
-			fmt.Println(sc.Text())
+		// Output if meets minimum score
+		if score >= config.minScore {
+			output := line
+			if config.showScore {
+				output = fmt.Sprintf("[%d] %s", score, line)
+			}
+			if config.verbose && len(reasons) > 0 {
+				output = fmt.Sprintf("%s (%s)", output, strings.Join(reasons, ", "))
+			}
+			fmt.Println(output)
 		}
-
 	}
 
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+	}
 }
 
-// qsCheck looks a key=value pair from a query
-// string and returns true if it looks interesting
-func qsCheck(k, v string) bool {
+func isInterestingParam(k, v string) bool {
 	k = strings.ToLower(k)
 	v = strings.ToLower(v)
 
-	// the super-common utm_referrer etc
-	// are rarely interesting
-	if strings.HasPrefix(k, "utm_") {
+	// Skip common tracking parameters
+	if strings.HasPrefix(k, "utm_") || strings.HasPrefix(k, "ga_") ||
+		k == "fbclid" || k == "gclid" || k == "ref" || k == "source" {
 		return false
 	}
 
-	// value checks
-	return strings.HasPrefix(v, "http") ||
-		strings.Contains(v, "{") ||
-		strings.Contains(v, "[") ||
-		strings.Contains(v, "/") ||
-		strings.Contains(v, "\\") ||
-		strings.Contains(v, "<") ||
-		strings.Contains(v, "(") ||
-		// shoutout to liveoverflow ;)
-		strings.Contains(v, "eyj") ||
+	// Interesting value patterns
+	interestingValues := strings.HasPrefix(v, "http") ||
+		strings.Contains(v, "{") || strings.Contains(v, "[") ||
+		strings.Contains(v, "/") || strings.Contains(v, "\\") ||
+		strings.Contains(v, "<") || strings.Contains(v, ">") ||
+		strings.Contains(v, "(") || strings.Contains(v, ")") ||
+		strings.Contains(v, "eyj") || // JWT
+		strings.Contains(v, "base64") ||
+		strings.Contains(v, "..") ||
+		strings.Contains(v, "%00") ||
+		strings.Contains(v, "\x00")
 
-		// key checks
-		strings.Contains(k, "redirect") ||
+	// Interesting key patterns
+	interestingKeys := strings.Contains(k, "redirect") ||
 		strings.Contains(k, "debug") ||
-		strings.Contains(k, "password") ||
-		strings.Contains(k, "passwd") ||
+		strings.Contains(k, "test") ||
 		strings.Contains(k, "file") ||
-		strings.Contains(k, "fn") ||
+		strings.Contains(k, "path") ||
 		strings.Contains(k, "template") ||
 		strings.Contains(k, "include") ||
 		strings.Contains(k, "require") ||
@@ -179,34 +327,52 @@ func qsCheck(k, v string) bool {
 		strings.Contains(k, "src") ||
 		strings.Contains(k, "href") ||
 		strings.Contains(k, "func") ||
-		strings.Contains(k, "callback")
+		strings.Contains(k, "callback") ||
+		strings.Contains(k, "exec") ||
+		strings.Contains(k, "cmd") ||
+		strings.Contains(k, "command") ||
+		strings.Contains(k, "query") ||
+		strings.Contains(k, "search") ||
+		strings.Contains(k, "q")
+
+	return interestingValues || interestingKeys
 }
 
 func isBoringStaticFile(u *url.URL) bool {
-	exts := []string{
-		// OK, so JS could be interesting, but 99% of the time it's boring.
-		".js",
+	boringExts := []string{
+		".html", ".htm",
+		".css", ".scss", ".sass", ".less",
+		".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".webp",
+		".eot", ".ttf", ".woff", ".woff2", ".otf",
+		".mp3", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm",
+		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+		".zip", ".rar", ".tar", ".gz", ".7z",
+	}
 
-		".html",
-		".htm",
-		".svg",
-		".eot",
-		".ttf",
-		".woff",
-		".woff2",
-		".png",
-		".jpg",
-		".jpeg",
-		".gif",
-		".ico",
+	// JavaScript is conditionally boring
+	if !config.includeJS {
+		boringExts = append(boringExts, ".js", ".map", ".min.js")
 	}
 
 	p := strings.ToLower(u.EscapedPath())
-	for _, e := range exts {
-		if strings.HasSuffix(p, e) {
+	for _, ext := range boringExts {
+		if strings.HasSuffix(p, ext) {
 			return true
 		}
 	}
 
 	return false
+}
+
+func buildDedupeKey(u *url.URL) string {
+	// Get sorted parameter names for consistent deduplication
+	params := make([]string, 0)
+	for param := range u.Query() {
+		params = append(params, param)
+	}
+	sort.Strings(params)
+
+	// Build key from hostname, path, and sorted params
+	key := fmt.Sprintf("%s%s?%s", u.Hostname(), u.EscapedPath(), strings.Join(params, "&"))
+	return key
 }
