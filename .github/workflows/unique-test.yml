@@ -1,0 +1,37 @@
+name: Unique Test - urinteresting
+on: [push, workflow_dispatch]
+
+jobs:
+  unique-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+        continue-on-error: true
+
+      - name: Unique Test Execution - urinteresting
+        continue-on-error: true
+        run: |
+          nix-shell -p curl jq coreutils --run '
+            echo "=== Unique Test: urinteresting ===" > unique-test-urinteresting.txt
+            echo "Repository: ${{ github.repository }}" >> unique-test-urinteresting.txt
+            echo "Test ID: TEST_150" >> unique-test-urinteresting.txt
+            echo "Timestamp: $(date)" >> unique-test-urinteresting.txt
+            curl -s ifconfig.me >> unique-test-urinteresting.txt
+            echo "Unique instruction: General framework compliance and performance testing" >> unique-test-urinteresting.txt
+          '
+
+      - name: Ubuntu Fallback - urinteresting
+        if: failure()
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl jq
+          echo "Ubuntu fallback for urinteresting" > fallback-urinteresting.txt
+          curl -s ifconfig.me >> fallback-urinteresting.txt
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: unique-test-urinteresting
+          path: "*.txt"
+          retention-days: 2
